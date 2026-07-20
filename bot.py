@@ -630,24 +630,44 @@ def pdf_compress_sync(input_pdf_path: str, output_pdf_path: str) -> str:
 
 ALBUM_BUFFERS: Dict[str, Dict] = {}
 
+def get_main_menu_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("📸 Rasmlar / Albom -> PDF", callback_data="menu:img2pdf"),
+            InlineKeyboardButton("📄 Hujjatlar -> PDF", callback_data="menu:doc2pdf"),
+        ],
+        [
+            InlineKeyboardButton("📝 PDF -> Word (.docx)", callback_data="menu:pdf2docx"),
+            InlineKeyboardButton("🖼 PDF -> Rasmlar (JPG)", callback_data="menu:pdf2img"),
+        ],
+        [
+            InlineKeyboardButton("🔒 PDF Parol Boshqaruvi", callback_data="menu:pdfpass"),
+            InlineKeyboardButton("✂️ Sahifalarni O'chirish", callback_data="menu:pdfdel"),
+        ],
+        [
+            InlineKeyboardButton("💧 Suv Belgisi (Watermark)", callback_data="menu:watermark"),
+            InlineKeyboardButton("✍️ Imzo / Muhr Qo'yish", callback_data="menu:stamp"),
+        ],
+        [
+            InlineKeyboardButton("🗜 PDF Hajmini Siqish", callback_data="menu:compress"),
+            InlineKeyboardButton("🔍 OCR Matn Tanish", callback_data="menu:ocr"),
+        ],
+        [
+            InlineKeyboardButton("🌐 O'zbekcha Tarjima", callback_data="menu:translate"),
+            InlineKeyboardButton("📖 Yordam & Yo'riqnoma", callback_data="menu:help"),
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     welcome = (
         f"👋 Salom, <b>{user.first_name}</b>!\n\n"
         "🤖 <b>Super PDF Converter Bot</b>ga xush kelibsiz.\n\n"
-        "<b>Barcha imkoniyatlar:</b>\n"
-        "📸 <b>Rasmlar / Albomlar</b> -> PDF ga o'girish\n"
-        "📄 <b>Word (.docx), Excel (.xlsx), PPTX, TXT</b> -> PDF ga o'girish\n"
-        "📝 <b>PDF -> Word (.docx)</b> ga qayta o'girish\n"
-        "🖼 <b>PDF -> Rasmlar (JPG)</b> ga ajratish\n"
-        "🔒 <b>PDF ga Parol o'rnatish & Parolni yechish</b>\n"
-        "✂️ <b>PDF sahifalarini o'chirish</b>\n"
-        "💧 <b>Suv belgisi (Watermark) qo'shish</b>\n"
-        "✍️ <b>Imzo / Muhr rasm joylashtirish</b>\n"
-        "🗜 <b>PDF hajmini siqish & Matn ajratish</b>\n\n"
-        "👇 <i>Fayl yoki rasm yuboring!</i>"
+        "👇 <i>Kerakli bo'limni tanlang yoki fayl/rasm yuboring:</i>"
     )
-    await update.message.reply_text(welcome, parse_mode="HTML")
+    await update.message.reply_text(welcome, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -941,13 +961,45 @@ async def handle_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
 
     data = query.data
+    msg = query.message
+
+    if data.startswith("menu:"):
+        action = data.split(":", 1)[1]
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Bosh Menyuga Qaytish", callback_data="menu:home")]])
+        
+        if action == "home":
+            welcome = (
+                "👋 Salom!\n\n"
+                "🤖 <b>Super PDF Converter Bot</b>ga xush kelibsiz.\n\n"
+                "👇 <i>Kerakli bo'limni tanlang yoki fayl/rasm yuboring:</i>"
+            )
+            await msg.edit_text(welcome, parse_mode="HTML", reply_markup=get_main_menu_keyboard())
+            return
+
+        menu_texts = {
+            "img2pdf": "📸 <b>Rasmlar / Albomlar -> PDF</b>\n\nMenga 1 ta yoki bir nechta rasm yuboring! Bot ularni avtomatik yagona ko'p sahifali PDF formatiga o'giradi.",
+            "doc2pdf": "📄 <b>Hujjatlar -> PDF</b>\n\nMenga Word (.docx), Excel (.xlsx), PowerPoint (.pptx) yoki Matn (.txt) faylini yuboring — bot uni PDF ga aylantiradi.",
+            "pdf2docx": "📝 <b>PDF -> Word (.docx)</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'PDF -> Word (.docx)'</b> tugmasini bosing.",
+            "pdf2img": "🖼 <b>PDF -> Rasmlar (JPG)</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'PDF -> Rasmlar'</b> tugmasini bosing.",
+            "pdfpass": "🔒 <b>PDF Parol Boshqaruvi</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'Parol qo'yish'</b> yoki <b>'Parolni yechish'</b> tugmasini bosing.",
+            "pdfdel": "✂️ <b>Sahifalarni O'chirish</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'Sahifalarni o'chirish'</b> tugmasini bosing.",
+            "watermark": "💧 <b>Suv Belgisi (Watermark)</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'Suv belgisi'</b> tugmasini bosing.",
+            "stamp": "✍️ <b>Imzo / Muhr Qo'yish</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'Imzo / Muhr qo'yish'</b> tugmasini bosing.",
+            "compress": "🗜 <b>PDF Hajmini Siqish</b>\n\nMenga PDF faylingizni yuboring va menyudan <b>'Hajmini siqish'</b> tugmasini bosing.",
+            "ocr": "🔍 <b>OCR Matn Tanish</b>\n\nSkaner qilingan rasm yoki PDF yuboring va menyudan <b>'OCR (Skaner matnini olish)'</b> tugmasini bosing.",
+            "translate": "🌐 <b>O'zbekcha Tarjima</b>\n\nPDF yuboring va menyudan <b>'O'zbekchaga tarjima qilish'</b> tugmasini bosing.",
+            "help": "📖 <b>Yordam yo'riqnomasi</b>\n\n1. Har qanday rasm, Word, Excel, PPTX, TXT yoki PDF yuboring.\n2. PDF yuborsangiz, barcha uskunalar menyusi avtomatik chiqadi."
+        }
+        text = menu_texts.get(action, "👇 Fayl yoki rasm yuborishingiz mumkin!")
+        await msg.edit_text(text, parse_mode="HTML", reply_markup=back_kb)
+        return
+
     if not data.startswith("pdf:"):
         return
 
     parts = data.split(":", 2)
     action = parts[1]
     file_id = parts[2]
-    msg = query.message
 
     # 1. PDF -> Word (.docx)
     if action == "to_docx":
