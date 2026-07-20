@@ -38,6 +38,7 @@ from reportlab.platypus import (
     TableStyle,
     PageBreak,
     KeepTogether,
+    Image as RLImage,
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
@@ -295,6 +296,36 @@ def images_to_pdf_sync(image_paths: List[str], output_pdf_path: str) -> str:
                 except Exception:
                     pass
 
+    return output_pdf_path
+
+
+def images_to_pdf_a4_sync(image_paths: List[str], output_pdf_path: str) -> str:
+    """Rasmlarni A4 sahifasiga moslab (A4 Fit proportsional scaling) PDF ga o'girish"""
+    c = canvas.Canvas(output_pdf_path, pagesize=A4)
+    page_w, page_h = A4[0], A4[1]
+    processed_count = 0
+    
+    for path in image_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with Image.open(path) as img:
+                w, h = img.size
+                scale = min(page_w / w, page_h / h)
+                new_w, new_h = w * scale, h * scale
+                x = (page_w - new_w) / 2
+                y = (page_h - new_h) / 2
+                
+                c.drawImage(path, x, y, width=new_w, height=new_h)
+                c.showPage()
+                processed_count += 1
+        except Exception as e:
+            logger.error(f"Image to A4 error ({path}): {e}")
+
+    if processed_count == 0:
+        raise ValueError("Yaroqli rasmlar topilmadi.")
+
+    c.save()
     return output_pdf_path
 
 
@@ -629,6 +660,7 @@ def pdf_compress_sync(input_pdf_path: str, output_pdf_path: str) -> str:
 # ==========================================
 
 ALBUM_BUFFERS: Dict[str, Dict] = {}
+PENDING_IMAGE_TASKS: Dict[str, List[str]] = {}
 
 def get_main_menu_keyboard():
     keyboard = [
@@ -688,6 +720,35 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ALBUM & PHOTO HANDLERS
 # ------------------------------------------
 
+async def prompt_image_fit_mode(bot, chat_id: int, photos: List[str], status_msg=None):
+    """Foydalanuvchiga A4 o'lchamga moslash bo'yicha Inline Keyboard prompt chiqarish"""
+    task_id = f"img_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
+    PENDING_IMAGE_TASKS[task_id] = photos
+
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Ha (A4 qog'ozga moslash)", callback_data=f"imgfit:a4:{task_id}"),
+            InlineKeyboardButton("❌ Yo'q (Asl o'lchamda saqlash)", callback_data=f"imgfit:orig:{task_id}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    text = (
+        "📐 <b>Rasmlar PDF joylashuv rejimi:</b>\n\n"
+        f"Menga <b>{len(photos)} ta rasm</b> yuborildi.\n"
+        "Ushbu rasmlar A4 qog'oz o'lchamiga moslab (A4 Fit) joylashtirilsinmi?"
+    )
+
+    if status_msg:
+        try:
+            await status_msg.edit_text(text, parse_mode="HTML", reply_markup=reply_markup)
+            return
+        except Exception:
+            pass
+
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", reply_markup=reply_markup)
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     
@@ -730,29 +791,12 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Yakka rasm
     file = await photo.get_file()
-    status_msg = await msg.reply_text(f"📥 Rasm yuklanmoqda... {render_progress_bar(20)}")
+    status_msg = await msg.reply_text("📥 Rasm yuklanmoqda...")
+    tmp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    tmp_img.close()
+    await file.download_to_drive(tmp_img.name)
 
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        input_path = os.path.join(tmp_dir, "input.jpg")
-        output_pdf = os.path.join(tmp_dir, "converted.pdf")
-        
-        await file.download_to_drive(input_path)
-        await status_msg.edit_text(f"⚡ PDF yaratilmoqda... {render_progress_bar(70)}")
-
-        try:
-            await asyncio.to_thread(images_to_pdf_sync, [input_path], output_pdf)
-            await status_msg.edit_text(f"✅ Tayyor! {render_progress_bar(100)}")
-            
-            with open(output_pdf, "rb") as f:
-                await msg.reply_document(
-                    document=f,
-                    filename=f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-                    caption="✅ PDF tayyor bo'ldi!",
-                )
-            await status_msg.delete()
-        except Exception as e:
-            logger.error(f"Single photo conversion error: {e}")
-            await status_msg.edit_text(f"❌ Xatolik: {e}")
+    await prompt_image_fit_mode(context.bot, chat_id, [tmp_img.name], status_msg)
 
 
 async def process_album_after_delay(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
@@ -765,37 +809,7 @@ async def process_album_after_delay(media_group_id: str, context: ContextTypes.D
     photos = buffer["photos"]
     status_msg = buffer["status_msg"]
 
-    if status_msg:
-        try:
-            await status_msg.edit_text(f"⚡ {len(photos)} ta rasm PDF ga o'girilmoqda... {render_progress_bar(60)}")
-        except Exception:
-            pass
-
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        output_pdf = os.path.join(tmp_dir, "album.pdf")
-        try:
-            await asyncio.to_thread(images_to_pdf_sync, photos, output_pdf)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            with open(output_pdf, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=chat_id,
-                    document=f,
-                    filename=f"album_{timestamp}.pdf",
-                    caption=f"✅ {len(photos)} ta rasmdan iborat PDF tayyor bo'ldi!",
-                )
-            if status_msg:
-                await status_msg.delete()
-        except Exception as e:
-            logger.error(f"Album error: {e}")
-            if status_msg:
-                await status_msg.edit_text(f"❌ Xatolik: {e}")
-        finally:
-            for p in photos:
-                if os.path.exists(p):
-                    try:
-                        os.remove(p)
-                    except Exception:
-                        pass
+    await prompt_image_fit_mode(context.bot, chat_id, photos, status_msg)
 
 
 # ------------------------------------------
@@ -992,6 +1006,47 @@ async def handle_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         }
         text = menu_texts.get(action, "👇 Fayl yoki rasm yuborishingiz mumkin!")
         await msg.edit_text(text, parse_mode="HTML", reply_markup=back_kb)
+        return
+
+    if data.startswith("imgfit:"):
+        parts = data.split(":", 2)
+        fit_mode = parts[1]
+        task_id = parts[2]
+        
+        photos = PENDING_IMAGE_TASKS.pop(task_id, None)
+        if not photos:
+            await msg.edit_text("⚠️ Rasmlar topilmadi yoki sessiya muddati tugadi.")
+            return
+
+        await msg.edit_text(f"⚡ PDF yaratilmoqda... {render_progress_bar(60)}")
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_pdf = os.path.join(tmp_dir, "converted.pdf")
+            try:
+                if fit_mode == "a4":
+                    await asyncio.to_thread(images_to_pdf_a4_sync, photos, output_pdf)
+                else:
+                    await asyncio.to_thread(images_to_pdf_sync, photos, output_pdf)
+                
+                await msg.edit_text(f"✅ Tayyor! {render_progress_bar(100)}")
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                with open(output_pdf, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=msg.chat_id,
+                        document=f,
+                        filename=f"converted_{timestamp}.pdf",
+                        caption=f"✅ {len(photos)} ta rasmdan iborat PDF tayyor bo'ldi!",
+                    )
+                await msg.delete()
+            except Exception as e:
+                logger.error(f"Image PDF fit error: {e}")
+                await msg.edit_text(f"❌ PDF yaratishda xatolik: {e}")
+            finally:
+                for p in photos:
+                    if os.path.exists(p):
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
         return
 
     if not data.startswith("pdf:"):
