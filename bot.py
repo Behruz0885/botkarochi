@@ -6,6 +6,7 @@ Fayllarni (rasm, matn, hujjat) PDF ga aylantiradi.
 
 import os
 import io
+import asyncio
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
@@ -369,6 +370,11 @@ def main():
         print("2. bot.py faylida TOKEN o'rniga tokeningizni yozing")
         print("=" * 50)
         return
+
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
 
     app = Application.builder().token(TOKEN).build()
 
