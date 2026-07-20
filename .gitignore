@@ -1,0 +1,13 @@
+.env
+__pycache__/
+*.pyc
+temp_*.jpg
+temp_*.png
+output_*.pdf
+album_*.jpg
+album_*.pdf
+doc_*.txt
+doc_*.pdf
+*.tmp.jpg
+.venv/
+venv/

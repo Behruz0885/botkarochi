@@ -1,0 +1,5 @@
+python-telegram-bot==21.3
+Pillow==10.4.0
+reportlab>=4.2.2
+img2pdf==0.6.0
+python-dotenv==1.0.0
