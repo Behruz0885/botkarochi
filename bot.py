@@ -107,8 +107,92 @@ def init_fonts():
 
 init_fonts()
 
-# Ruxsat berilgan fayl kengaytmalari
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
+# Import OpenCV for Smart Auto-Cropping & Enhancement
+import cv2
+import numpy as np
+
+def order_points(pts: np.ndarray) -> np.ndarray:
+    rect = np.zeros((4, 2), dtype="float32")
+    s = pts.sum(axis=1)
+    rect[0] = pts[np.argmin(s)]
+    rect[2] = pts[np.argmax(s)]
+    diff = np.diff(pts, axis=1)
+    rect[1] = pts[np.argmin(diff)]
+    rect[3] = pts[np.argmax(diff)]
+    return rect
+
+def four_point_transform(image: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    rect = order_points(pts)
+    (tl, tr, br, bl) = rect
+
+    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+    maxWidth = max(int(widthA), int(widthB))
+
+    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
+    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
+    maxHeight = max(int(heightA), int(heightB))
+
+    dst = np.array([
+        [0, 0],
+        [maxWidth - 1, 0],
+        [maxWidth - 1, maxHeight - 1],
+        [0, maxHeight - 1]], dtype="float32")
+
+    M = cv2.getPerspectiveTransform(rect, dst)
+    warped = cv2.warpPerspective(image, M, (maxWidth, maxHeight))
+    return warped
+
+def auto_crop_document_sync(image_path: str, output_path: str) -> str:
+    """OpenCV yordamida hujjat burchaklarini topib, stoldan ajratish va tekislash (Perspective Warp)"""
+    image = cv2.imread(image_path)
+    if image is None:
+        return image_path
+
+    orig = image.copy()
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edged = cv2.Canny(blurred, 75, 200)
+
+    contours, _ = cv2.findContours(edged.copy(), cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:5]
+
+    doc_cnt = None
+    for c in contours:
+        peri = cv2.arcLength(c, True)
+        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+        if len(approx) == 4:
+            doc_cnt = approx
+            break
+
+    if doc_cnt is not None:
+        warped = four_point_transform(orig, doc_cnt.reshape(4, 2))
+    else:
+        warped = orig
+
+    cv2.imwrite(output_path, warped)
+    return output_path
+
+def enhance_document_scan_sync(image_path: str, output_path: str, mode: str = "magic_color") -> str:
+    """Hujjat rasmini yorqin skaner holatiga keltirish"""
+    image = cv2.imread(image_path)
+    if image is None:
+        return image_path
+
+    if mode == "magic_color":
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        bg = cv2.medianBlur(gray, 21)
+        diff = 255 - cv2.absdiff(gray, bg)
+        norm_diff = cv2.normalize(diff, None, alpha=0, beta=255, norm_type=cv2.NORM_MINMAX)
+        result = cv2.cvtColor(norm_diff, cv2.COLOR_GRAY2BGR)
+    elif mode == "bw":
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        result = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    else:
+        result = image
+
+    cv2.imwrite(output_path, result)
+    return output_path
 TEXT_EXTENSIONS = {".txt", ".md", ".log", ".json", ".csv", ".py", ".js", ".html", ".css", ".xml"}
 DOCX_EXTENSIONS = {".docx"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
@@ -425,19 +509,86 @@ def pdf_add_watermark_sync(input_pdf_path: str, output_pdf_path: str, text: str)
     return output_pdf_path
 
 
-def pdf_add_stamp_sync(input_pdf_path: str, output_pdf_path: str, stamp_image_path: str, page_num: int = 1) -> str:
-    """PDF ga imzo / muhr rasmini joylashtirish"""
-    doc = fitz.open(input_pdf_path)
-    try:
-        target_idx = max(0, min(page_num - 1, len(doc) - 1))
-        page = doc[target_idx]
-        rect = page.rect
-        stamp_rect = fitz.Rect(rect.width - 170, rect.height - 170, rect.width - 20, rect.height - 20)
-        page.insert_image(stamp_rect, filename=stamp_image_path, overlay=True)
-        doc.save(output_pdf_path)
-    finally:
-        doc.close()
-    return output_pdf_path
+# Import Translation and OCR
+from deep_translator import GoogleTranslator
+
+try:
+    import pytesseract
+    def init_tesseract():
+        tesseract_paths = [
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            r"C:\Users\Leopard\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+            "/usr/bin/tesseract",
+            "/usr/local/bin/tesseract",
+        ]
+        for p in tesseract_paths:
+            if os.path.exists(p):
+                pytesseract.pytesseract.tesseract_cmd = p
+                logger.info(f"Tesseract OCR topildi: {p}")
+                return
+    init_tesseract()
+except Exception as e:
+    logger.warning(f"PyTesseract yuklanishda xatolik: {e}")
+    pytesseract = None
+
+def translate_text_sync(text: str, target_lang: str = "uz") -> str:
+    """Matnni ko'rsatilgan tilga tarjima qilish"""
+    if not text.strip():
+        return text
+    translator = GoogleTranslator(source="auto", target=target_lang)
+    chunks = text.split("\n")
+    translated_chunks = []
+    for chunk in chunks:
+        if chunk.strip():
+            try:
+                if len(chunk) > 4000:
+                    sub_chunks = [chunk[i:i+4000] for i in range(0, len(chunk), 4000)]
+                    t_sub = [translator.translate(sc) for sc in sub_chunks]
+                    translated_chunks.append(" ".join(t_sub))
+                else:
+                    translated_chunks.append(translator.translate(chunk))
+            except Exception as e:
+                logger.warning(f"Translation chunk error: {e}")
+                translated_chunks.append(chunk)
+        else:
+            translated_chunks.append("")
+    return "\n".join(translated_chunks)
+
+
+def ocr_extract_text_sync(image_or_pdf_path: str) -> str:
+    """Skaner qilingan rasm yoki PDF dan OCR orqali matn tanish"""
+    if not pytesseract:
+        return "⚠️ OCR moduli o'rnatilmagan yoki Tesseract OCR binary topilmadi."
+
+    ext = Path(image_or_pdf_path).suffix.lower()
+    text_results = []
+    
+    if ext == ".pdf":
+        doc = fitz.open(image_or_pdf_path)
+        try:
+            for i, page in enumerate(doc):
+                pix = page.get_pixmap(dpi=150)
+                img = Image.open(io.BytesIO(pix.tobytes("png")))
+                try:
+                    page_text = pytesseract.image_to_string(img, lang="eng+rus")
+                except Exception:
+                    page_text = pytesseract.image_to_string(img)
+                text_results.append(f"--- Sahifa {i+1} (OCR) ---\n{page_text}")
+        finally:
+            doc.close()
+    else:
+        try:
+            img = Image.open(image_or_pdf_path)
+            try:
+                ocr_text = pytesseract.image_to_string(img, lang="eng+rus")
+            except Exception:
+                ocr_text = pytesseract.image_to_string(img)
+            text_results.append(ocr_text)
+        except Exception as e:
+            logger.error(f"OCR Error: {e}")
+
+    return "\n\n".join(text_results)
 
 
 def pdf_to_images_sync(pdf_path: str, output_dir: str) -> List[str]:
@@ -748,6 +899,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🖼 PDF -> Rasmlar", callback_data=f"pdf:to_img:{file_id}"),
             ],
             [
+                InlineKeyboardButton("🌐 O'zbekchaga tarjima qilish", callback_data=f"pdf:translate:{file_id}"),
+                InlineKeyboardButton("🔍 OCR (Skaner matnini olish)", callback_data=f"pdf:ocr:{file_id}"),
+            ],
+            [
                 InlineKeyboardButton("🔒 Parol qo'yish", callback_data=f"pdf:encrypt:{file_id}"),
                 InlineKeyboardButton("🔓 Parolni yechish", callback_data=f"pdf:decrypt:{file_id}"),
             ],
@@ -818,6 +973,64 @@ async def handle_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.error(f"PDF to docx error: {e}")
             await msg.edit_text(f"❌ Word o'girishda xatolik: {e}")
+
+    # 2. PDF -> O'zbekcha Tarjima
+    elif action == "translate":
+        await msg.edit_text(f"🌐 PDF matni o'zbek tiliga tarjima qilinmoqda... {render_progress_bar(40)}")
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pdf_path = os.path.join(tmp_dir, "input.pdf")
+                output_pdf = os.path.join(tmp_dir, "translated.pdf")
+                await telegram_file.download_to_drive(pdf_path)
+                
+                raw_text = await asyncio.to_thread(pdf_extract_text_sync, pdf_path)
+                await msg.edit_text(f"⚡ Matn o'zbek tiliga o'girilmoqda... {render_progress_bar(70)}")
+                translated_text = await asyncio.to_thread(translate_text_sync, raw_text, "uz")
+                
+                await asyncio.to_thread(text_to_pdf_sync, translated_text, output_pdf, "Tarjima qilingan hujjat")
+                
+                with open(output_pdf, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=msg.chat_id,
+                        document=f,
+                        filename="translated_uz.pdf",
+                        caption="✅ PDF matni o'zbek tiliga tarjima qilindi!",
+                    )
+                await msg.delete()
+        except Exception as e:
+            logger.error(f"PDF translate error: {e}")
+            await msg.edit_text(f"❌ Tarjimada xatolik: {e}")
+
+    # 3. PDF -> OCR Matn Tanish
+    elif action == "ocr":
+        await msg.edit_text(f"🔍 Skaner PDF OCR yordamida o'qilmoqda... {render_progress_bar(50)}")
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pdf_path = os.path.join(tmp_dir, "input.pdf")
+                await telegram_file.download_to_drive(pdf_path)
+                
+                ocr_text = await asyncio.to_thread(ocr_extract_text_sync, pdf_path)
+                if not ocr_text.strip():
+                    await msg.edit_text("⚠️ OCR yordamida matn topilmadi.")
+                    return
+                
+                txt_path = os.path.join(tmp_dir, "ocr_text.txt")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(ocr_text)
+                
+                with open(txt_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=msg.chat_id,
+                        document=f,
+                        filename="ocr_extracted.txt",
+                        caption="🔍 OCR orqali aniqlangan matn!",
+                    )
+                await msg.delete()
+        except Exception as e:
+            logger.error(f"PDF OCR error: {e}")
+            await msg.edit_text(f"❌ OCR amalda xatolik: {e}")
 
     # 2. PDF -> Rasmlar (JPG)
     elif action == "to_img":
