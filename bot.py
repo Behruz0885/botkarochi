@@ -1368,12 +1368,40 @@ async def process_stamp_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text(f"❌ Imzo qo'shishda xatolik: {e}")
 
 
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass
+
+def start_health_check_server():
+    port_str = os.getenv("PORT")
+    if port_str:
+        try:
+            port = int(port_str)
+            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            logger.info(f"Render Health Check HTTP server {port}-portda ishga tushdi.")
+        except Exception as e:
+            logger.warning(f"Health Check Server xatosi: {e}")
+
+
 def main():
     if TOKEN == "YOUR_BOT_TOKEN_HERE" or not TOKEN:
         print("=" * 50)
         print("XATOLIK: BOT_TOKEN o'rnatilmagan!")
         print("=" * 50)
         return
+
+    # Render port binding uchun HTTP Health Check serverini ishga tushirish
+    start_health_check_server()
 
     # Python 3.10+ / 3.14 Event loop tayyorlash
     try:
