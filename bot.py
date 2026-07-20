@@ -300,7 +300,7 @@ def images_to_pdf_sync(image_paths: List[str], output_pdf_path: str) -> str:
 
 
 def images_to_pdf_a4_sync(image_paths: List[str], output_pdf_path: str) -> str:
-    """Rasmlarni A4 sahifasiga moslab (A4 Fit proportsional scaling) PDF ga o'girish"""
+    """Rasmlarni A4 qog'ozni to'liq qoplaydigan qilib cho'zish (Full A4 stretch, 0 margin)"""
     c = canvas.Canvas(output_pdf_path, pagesize=A4)
     page_w, page_h = A4[0], A4[1]
     processed_count = 0
@@ -309,18 +309,12 @@ def images_to_pdf_a4_sync(image_paths: List[str], output_pdf_path: str) -> str:
         if not os.path.exists(path):
             continue
         try:
-            with Image.open(path) as img:
-                w, h = img.size
-                scale = min(page_w / w, page_h / h)
-                new_w, new_h = w * scale, h * scale
-                x = (page_w - new_w) / 2
-                y = (page_h - new_h) / 2
-                
-                c.drawImage(path, x, y, width=new_w, height=new_h)
-                c.showPage()
-                processed_count += 1
+            # A4 qog'ozni to'liq qoplab cho'zish (x=0, y=0, width=page_w, height=page_h)
+            c.drawImage(path, 0, 0, width=page_w, height=page_h)
+            c.showPage()
+            processed_count += 1
         except Exception as e:
-            logger.error(f"Image to A4 error ({path}): {e}")
+            logger.error(f"Image to A4 Full Stretch error ({path}): {e}")
 
     if processed_count == 0:
         raise ValueError("Yaroqli rasmlar topilmadi.")
@@ -727,7 +721,7 @@ async def prompt_image_fit_mode(bot, chat_id: int, photos: List[str], status_msg
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Ha (A4 qog'ozga moslash)", callback_data=f"imgfit:a4:{task_id}"),
+            InlineKeyboardButton("✅ Ha (A4 to'liq qoplash)", callback_data=f"imgfit:a4:{task_id}"),
             InlineKeyboardButton("❌ Yo'q (Asl o'lchamda saqlash)", callback_data=f"imgfit:orig:{task_id}"),
         ]
     ]
@@ -736,7 +730,7 @@ async def prompt_image_fit_mode(bot, chat_id: int, photos: List[str], status_msg
     text = (
         "📐 <b>Rasmlar PDF joylashuv rejimi:</b>\n\n"
         f"Menga <b>{len(photos)} ta rasm</b> yuborildi.\n"
-        "Ushbu rasmlar A4 qog'oz o'lchamiga moslab (A4 Fit) joylashtirilsinmi?"
+        "Ushbu rasmlar A4 qog'oz o'lchamiga moslab cho'zilsin va <b>A4 sahifasini to'liq qoplasinmi</b> (chekkalarida oq joy qolmaydi)?"
     )
 
     if status_msg:
