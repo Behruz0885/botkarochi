@@ -1,35 +1,66 @@
 #!/usr/bin/env python3
 """
 PDF Converter Telegram Bot
-Fayllarni (rasm, matn, hujjat) PDF ga aylantiradi.
+Fayllarni (rasmlar, albomlar, docx, txt, xlsx, pptx, pdf) PDF ga va aksincha aylantiruvchi universal bot.
 """
 
 import os
+import sys
 import io
+import re
+import glob
 import asyncio
 import logging
+import tempfile
+import chardet
 from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
 from PIL import Image
+import img2pdf
+import fitz  # PyMuPDF
+from pypdf import PdfReader, PdfWriter
+import docx
+import openpyxl
+from pptx import Presentation
+from pdf2docx import Converter
+
 import reportlab
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+    KeepTogether,
+)
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-import img2pdf
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaDocument,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
     ConversationHandler,
-    filters,
     ContextTypes,
+    filters,
 )
 
+# Logging sozlamalari
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -37,373 +68,1005 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 load_dotenv()
-
 TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-WAITING_FILE = 1
+# States for ConversationHandler if needed
+WAITING_PASSWORD = 1
+WAITING_PAGES = 2
+WAITING_WATERMARK = 3
+WAITING_STAMP_IMG = 4
 
-ALLOWED_EXTENSIONS = {
-    "image": [".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"],
-    "document": [".txt", ".docx", ".doc", ".odt", ".rtf"],
-}
+# Shriftlarni ro'yxatdan o'tkazish
+FONT_NAME = "Helvetica"
+FONT_BOLD = "Helvetica-Bold"
+
+def init_fonts():
+    global FONT_NAME, FONT_BOLD
+    font_candidates = [
+        ("C:/Windows/Fonts/arial.ttf", "C:/Windows/Fonts/arialbd.ttf"),
+        ("C:/Windows/Fonts/calibri.ttf", "C:/Windows/Fonts/calibrib.ttf"),
+        ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        ("/usr/share/fonts/TTF/DejaVuSans.ttf", "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf"),
+        ("/Library/Fonts/Arial.ttf", "/Library/Fonts/Arial Bold.ttf"),
+    ]
+    
+    for font_path, bold_path in font_candidates:
+        if os.path.exists(font_path):
+            try:
+                pdfmetrics.registerFont(TTFont("CustomUTF8", font_path))
+                FONT_NAME = "CustomUTF8"
+                if os.path.exists(bold_path):
+                    pdfmetrics.registerFont(TTFont("CustomUTF8-Bold", bold_path))
+                    FONT_BOLD = "CustomUTF8-Bold"
+                else:
+                    FONT_BOLD = "CustomUTF8"
+                logger.info(f"UTF-8 Shrift yuklandi: {font_path}")
+                return
+            except Exception as e:
+                logger.warning(f"Shrift xatosi ({font_path}): {e}")
+
+init_fonts()
+
+# Ruxsat berilgan fayl kengaytmalari
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff"}
+TEXT_EXTENSIONS = {".txt", ".md", ".log", ".json", ".csv", ".py", ".js", ".html", ".css", ".xml"}
+DOCX_EXTENSIONS = {".docx"}
+EXCEL_EXTENSIONS = {".xlsx", ".xls"}
+PPTX_EXTENSIONS = {".pptx", ".ppt"}
+
+def is_image_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in IMAGE_EXTENSIONS
+
+def is_text_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in TEXT_EXTENSIONS
+
+def is_docx_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in DOCX_EXTENSIONS
+
+def is_excel_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in EXCEL_EXTENSIONS
+
+def is_pptx_file(filename: str) -> bool:
+    return Path(filename).suffix.lower() in PPTX_EXTENSIONS
+
+def render_progress_bar(percent: int) -> str:
+    filled = int(percent / 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    return f"[{bar}] {percent}%"
+
+# Numbered Canvas class for Page X of Y footers
+class NumberedCanvas(canvas.Canvas):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._saved_page_states = []
+
+    def showPage(self):
+        self._saved_page_states.append(dict(self.__dict__))
+        self._startPage()
+
+    def save(self):
+        num_pages = len(self._saved_page_states)
+        for state in self._saved_page_states:
+            self.__dict__.update(state)
+            self.draw_page_number(num_pages)
+            super().showPage()
+        super().save()
+
+    def draw_page_number(self, page_count):
+        self.saveState()
+        self.setFont(FONT_NAME, 9)
+        self.setFillColor(colors.HexColor("#666666"))
+        page_text = f"Sahifa {self._pageNumber} / {page_count}"
+        self.drawRightString(A4[0] - 36, 25, page_text)
+        self.drawString(36, 25, "PDF Converter Bot tomonidan yaratildi")
+        self.setStrokeColor(colors.HexColor("#CCCCCC"))
+        self.setLineWidth(0.5)
+        self.line(36, 38, A4[0] - 36, 38)
+        self.restoreState()
 
 
-def is_image(filename):
-    ext = os.path.splitext(filename.lower())[1]
-    return ext in ALLOWED_EXTENSIONS["image"]
+# ==========================================
+# CONVERTER UTILITIES (CPU-bound Sync)
+# ==========================================
 
-
-def is_document(filename):
-    ext = os.path.splitext(filename.lower())[1]
-    return ext in ALLOWED_EXTENSIONS["document"]
-
-
-def images_to_pdf(image_paths, output_path):
+def images_to_pdf_sync(image_paths: List[str], output_pdf_path: str) -> str:
+    """Rasmlar ro'yxatini yagona PDF ga o'girish"""
     valid_paths = []
-    for p in image_paths:
-        if os.path.exists(p):
-            valid_paths.append(p)
+    temp_files_to_clean = []
+    
+    for path in image_paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            with Image.open(path) as img:
+                if img.mode in ("RGBA", "P", "LA", "CMYK"):
+                    rgb_img = Image.new("RGB", img.size, (255, 255, 255))
+                    if img.mode == "RGBA":
+                        rgb_img.paste(img, mask=img.split()[3])
+                    else:
+                        rgb_img.paste(img.convert("RGB"))
+                    
+                    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+                    rgb_img.save(tmp_file.name, "JPEG", quality=95)
+                    tmp_file.close()
+                    valid_paths.append(tmp_file.name)
+                    temp_files_to_clean.append(tmp_file.name)
+                else:
+                    valid_paths.append(path)
+        except Exception as e:
+            logger.error(f"Rasm xatosi ({path}): {e}")
 
     if not valid_paths:
-        return None
+        raise ValueError("Yaroqli rasmlar topilmadi.")
 
-    if len(valid_paths) == 1:
-        img = Image.open(valid_paths[0])
-        if img.mode == "RGBA":
-            img = img.convert("RGB")
-            tmp_path = valid_paths[0] + ".tmp.jpg"
-            img.save(tmp_path, "JPEG")
-            valid_paths[0] = tmp_path
+    try:
+        pdf_bytes = img2pdf.convert(valid_paths)
+        with open(output_pdf_path, "wb") as f:
+            f.write(pdf_bytes)
+    finally:
+        for tmp in temp_files_to_clean:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except Exception:
+                    pass
 
-    with open(output_path, "wb") as f:
-        f.write(img2pdf.convert(valid_paths))
-    return output_path
-
-
-def image_to_pdf_with_reportlab(image_path, output_path):
-    img = Image.open(image_path)
-    img_width, img_height = img.size
-
-    c = canvas.Canvas(output_path, pagesize=A4)
-    page_width, page_height = A4
-
-    max_width = page_width - 2 * inch
-    max_height = page_height - 2 * inch
-
-    ratio = min(max_width / img_width, max_height / img_height)
-    new_width = img_width * ratio
-    new_height = img_height * ratio
-
-    x = (page_width - new_width) / 2
-    y = (page_height - new_height) / 2
-
-    if img.mode == "RGBA":
-        img = img.convert("RGB")
-        tmp_path = image_path + ".tmp.jpg"
-        img.save(tmp_path, "JPEG")
-        c.drawImage(tmp_path, x, y, new_width, new_height)
-        os.remove(tmp_path)
-    else:
-        c.drawImage(ImageReader(img), x, y, new_width, new_height)
-
-    c.save()
-    return output_path
+    return output_pdf_path
 
 
-def text_to_pdf(text_content, output_path):
-    c = canvas.Canvas(output_path, pagesize=A4)
-    page_width, page_height = A4
+def text_to_pdf_sync(text_content: str, output_pdf_path: str, title: str = "Hujjat") -> str:
+    """Matnni PDF ga o'girish"""
+    doc = SimpleDocTemplate(
+        output_pdf_path,
+        pagesize=A4,
+        leftMargin=36, rightMargin=36, topMargin=45, bottomMargin=50,
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "DocTitle", parent=styles["Heading1"], fontName=FONT_BOLD, fontSize=18, leading=22, textColor=colors.HexColor("#1A365D"), spaceAfter=15,
+    )
+    body_style = ParagraphStyle(
+        "DocBody", parent=styles["Normal"], fontName=FONT_NAME, fontSize=11, leading=15, textColor=colors.HexColor("#2D3748"), spaceAfter=8,
+    )
 
-    text_obj = c.beginText(inch, page_height - inch)
-    text_obj.setFont("Helvetica", 12)
-    text_obj.setLeading(14)
+    story = [Paragraph(title, title_style), Spacer(1, 10)]
+    for line in text_content.split("\n"):
+        clean_line = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").strip()
+        if clean_line:
+            story.append(Paragraph(clean_line, body_style))
+        else:
+            story.append(Spacer(1, 6))
 
-    lines = text_content.split("\n")
-    for line in lines:
-        if text_obj.getY() < inch:
-            c.drawText(text_obj)
-            c.showPage()
-            text_obj = c.beginText(inch, page_height - inch)
-            text_obj.setFont("Helvetica", 12)
-            text_obj.setLeading(14)
-        text_obj.textLine(line)
-
-    c.drawText(text_obj)
-    c.save()
-    return output_path
+    doc.build(story, canvasmaker=NumberedCanvas)
+    return output_pdf_path
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def docx_to_pdf_sync(docx_path: str, output_pdf_path: str) -> str:
+    """.docx faylini PDF ga o'girish"""
+    document = docx.Document(docx_path)
+    doc = SimpleDocTemplate(
+        output_pdf_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=45, bottomMargin=50,
+    )
+    styles = getSampleStyleSheet()
+    heading_style = ParagraphStyle(
+        "DocxHeading", parent=styles["Heading1"], fontName=FONT_BOLD, fontSize=16, leading=20, textColor=colors.HexColor("#1A202C"), spaceBefore=12, spaceAfter=6,
+    )
+    body_style = ParagraphStyle(
+        "DocxBody", parent=styles["Normal"], fontName=FONT_NAME, fontSize=10.5, leading=14.5, textColor=colors.HexColor("#2D3748"), spaceAfter=6,
+    )
+
+    story = []
+    for para in document.paragraphs:
+        text = para.text.strip()
+        if not text:
+            story.append(Spacer(1, 4))
+            continue
+        safe_text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        if para.style.name.startswith("Heading"):
+            story.append(Paragraph(safe_text, heading_style))
+        else:
+            story.append(Paragraph(safe_text, body_style))
+
+    for table in document.tables:
+        table_data = []
+        for row in table.rows:
+            row_data = []
+            for cell in row.cells:
+                cell_text = cell.text.strip().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                row_data.append(Paragraph(cell_text, body_style))
+            table_data.append(row_data)
+        
+        if table_data:
+            t = Table(table_data)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#EDF2F7')),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E0')),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(Spacer(1, 8))
+            story.append(t)
+            story.append(Spacer(1, 8))
+
+    doc.build(story, canvasmaker=NumberedCanvas)
+    return output_pdf_path
+
+
+def excel_to_pdf_sync(excel_path: str, output_pdf_path: str) -> str:
+    """Excel (.xlsx) ni PDF ga o'girish"""
+    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    doc = SimpleDocTemplate(output_pdf_path, pagesize=A4, leftMargin=20, rightMargin=20, topMargin=40, bottomMargin=40)
+    story = []
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("ExTitle", parent=styles["Heading1"], fontName=FONT_BOLD, fontSize=15, textColor=colors.HexColor("#2B6CB0"), spaceAfter=8)
+    cell_style = ParagraphStyle("ExCell", parent=styles["Normal"], fontName=FONT_NAME, fontSize=8.5, leading=11)
+
+    for sheet in wb.worksheets:
+        story.append(Paragraph(f"📊 Varaq: {sheet.title}", title_style))
+        story.append(Spacer(1, 6))
+        table_data = []
+        for row in sheet.iter_rows(values_only=True):
+            if any(cell is not None for cell in row):
+                row_cells = [Paragraph(str(c) if c is not None else "", cell_style) for c in row]
+                table_data.append(row_cells)
+        if table_data:
+            t = Table(table_data)
+            t.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#E2E8F0')),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#CBD5E0')),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ]))
+            story.append(t)
+            story.append(Spacer(1, 15))
+
+    doc.build(story, canvasmaker=NumberedCanvas)
+    return output_pdf_path
+
+
+def pptx_to_pdf_sync(pptx_path: str, output_pdf_path: str) -> str:
+    """PowerPoint (.pptx) ni PDF ga o'girish"""
+    prs = Presentation(pptx_path)
+    doc = SimpleDocTemplate(output_pdf_path, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=40, bottomMargin=45)
+    story = []
+    styles = getSampleStyleSheet()
+    h_style = ParagraphStyle("SlideH", parent=styles["Heading1"], fontName=FONT_BOLD, fontSize=16, textColor=colors.HexColor("#2C5282"), leading=20, spaceAfter=8)
+    b_style = ParagraphStyle("SlideB", parent=styles["Normal"], fontName=FONT_NAME, fontSize=11, leading=15, spaceAfter=6)
+
+    for idx, slide in enumerate(prs.slides):
+        story.append(Paragraph(f"🎨 Slayd {idx + 1}", h_style))
+        story.append(Spacer(1, 4))
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for p in shape.text_frame.paragraphs:
+                    if p.text.strip():
+                        safe_text = p.text.strip().replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                        story.append(Paragraph(safe_text, b_style))
+        story.append(Spacer(1, 10))
+        if idx < len(prs.slides) - 1:
+            story.append(PageBreak())
+
+    doc.build(story, canvasmaker=NumberedCanvas)
+    return output_pdf_path
+
+
+def pdf_to_docx_sync(input_pdf_path: str, output_docx_path: str) -> str:
+    """PDF ni qayta Word (.docx) fayliga o'girish"""
+    cv = Converter(input_pdf_path)
+    cv.convert(output_docx_path)
+    cv.close()
+    return output_docx_path
+
+
+def pdf_encrypt_sync(input_pdf_path: str, output_pdf_path: str, password: str) -> str:
+    """PDF ga parol o'rnatish"""
+    reader = PdfReader(input_pdf_path)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt(password)
+    with open(output_pdf_path, "wb") as f:
+        writer.write(f)
+    return output_pdf_path
+
+
+def pdf_decrypt_sync(input_pdf_path: str, output_pdf_path: str, password: str) -> str:
+    """PDF parolini olib tashlash"""
+    reader = PdfReader(input_pdf_path)
+    if reader.is_encrypted:
+        success = reader.decrypt(password)
+        if not success:
+            raise ValueError("Noto'g'ri parol kiritildi!")
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    with open(output_pdf_path, "wb") as f:
+        writer.write(f)
+    return output_pdf_path
+
+
+def pdf_delete_pages_sync(input_pdf_path: str, output_pdf_path: str, pages_to_remove: List[int]) -> str:
+    """PDF dan ko'rsatilgan sahifalarni olib tashlash"""
+    reader = PdfReader(input_pdf_path)
+    writer = PdfWriter()
+    remove_set = set(p - 1 for p in pages_to_remove)
+    
+    added_count = 0
+    for idx, page in enumerate(reader.pages):
+        if idx not in remove_set:
+            writer.add_page(page)
+            added_count += 1
+            
+    if added_count == 0:
+        raise ValueError("Barcha sahifalar o'chirib tashlandi!")
+
+    with open(output_pdf_path, "wb") as f:
+        writer.write(f)
+    return output_pdf_path
+
+
+def pdf_add_watermark_sync(input_pdf_path: str, output_pdf_path: str, text: str) -> str:
+    """PDF sahifalariga suv belgisi (Watermark) qo'shish"""
+    doc = fitz.open(input_pdf_path)
+    try:
+        for page in doc:
+            rect = page.rect
+            page.insert_text(
+                fitz.Point(rect.width / 4, rect.height / 2),
+                text,
+                fontsize=36,
+                color=(0.7, 0.7, 0.7),
+                rotate=0,
+                overlay=True
+            )
+        doc.save(output_pdf_path)
+    finally:
+        doc.close()
+    return output_pdf_path
+
+
+def pdf_add_stamp_sync(input_pdf_path: str, output_pdf_path: str, stamp_image_path: str, page_num: int = 1) -> str:
+    """PDF ga imzo / muhr rasmini joylashtirish"""
+    doc = fitz.open(input_pdf_path)
+    try:
+        target_idx = max(0, min(page_num - 1, len(doc) - 1))
+        page = doc[target_idx]
+        rect = page.rect
+        stamp_rect = fitz.Rect(rect.width - 170, rect.height - 170, rect.width - 20, rect.height - 20)
+        page.insert_image(stamp_rect, filename=stamp_image_path, overlay=True)
+        doc.save(output_pdf_path)
+    finally:
+        doc.close()
+    return output_pdf_path
+
+
+def pdf_to_images_sync(pdf_path: str, output_dir: str) -> List[str]:
+    """PDF sahifalarini JPG rasmlarga ajratish"""
+    doc = fitz.open(pdf_path)
+    image_paths = []
+    for i in range(len(doc)):
+        page = doc[i]
+        pix = page.get_pixmap(dpi=150)
+        img_path = os.path.join(output_dir, f"page_{i+1}.jpg")
+        pix.save(img_path)
+        image_paths.append(img_path)
+    doc.close()
+    return image_paths
+
+
+def pdf_extract_text_sync(pdf_path: str) -> str:
+    """PDF dan matn ajratish"""
+    doc = fitz.open(pdf_path)
+    text = []
+    for i, page in enumerate(doc):
+        text.append(f"--- Sahifa {i+1} ---\n")
+        text.append(page.get_text())
+    doc.close()
+    return "\n".join(text)
+
+
+def pdf_compress_sync(input_pdf_path: str, output_pdf_path: str) -> str:
+    """PDF hajmini siqish"""
+    doc = fitz.open(input_pdf_path)
+    doc.save(output_pdf_path, garbage=4, deflate=True, clean=True)
+    doc.close()
+    return output_pdf_path
+
+
+# ==========================================
+# TELEGRAM BOT HANDLERS & CONVERSATIONS
+# ==========================================
+
+ALBUM_BUFFERS: Dict[str, Dict] = {}
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     welcome = (
-        f"Salom, {user.first_name}! \n\n"
-        "Men PDF Converter botman.\n\n"
-        "Menga quyidagi turdagi fayllarni yuboring:\n"
-        "  - Rasmlar (jpg, png, bmp, gif, webp)\n"
-        "  - Matn fayllari (.txt)\n\n"
-        "Men ularni PDF formatiga aylantiraman!\n\n"
-        "Bir nechta rasm yuborsangiz, ular bitta PDF ga birlashtiriladi.\n\n"
-        "Buyruqlar:\n"
-        "/start - Botni qayta ishga tushirish\n"
-        "/help - Yordam\n"
-        "/convert - Faylni PDF ga aylantirish"
+        f"👋 Salom, <b>{user.first_name}</b>!\n\n"
+        "🤖 <b>Super PDF Converter Bot</b>ga xush kelibsiz.\n\n"
+        "<b>Barcha imkoniyatlar:</b>\n"
+        "📸 <b>Rasmlar / Albomlar</b> -> PDF ga o'girish\n"
+        "📄 <b>Word (.docx), Excel (.xlsx), PPTX, TXT</b> -> PDF ga o'girish\n"
+        "📝 <b>PDF -> Word (.docx)</b> ga qayta o'girish\n"
+        "🖼 <b>PDF -> Rasmlar (JPG)</b> ga ajratish\n"
+        "🔒 <b>PDF ga Parol o'rnatish & Parolni yechish</b>\n"
+        "✂️ <b>PDF sahifalarini o'chirish</b>\n"
+        "💧 <b>Suv belgisi (Watermark) qo'shish</b>\n"
+        "✍️ <b>Imzo / Muhr rasm joylashtirish</b>\n"
+        "🗜 <b>PDF hajmini siqish & Matn ajratish</b>\n\n"
+        "👇 <i>Fayl yoki rasm yuboring!</i>"
     )
-    await update.message.reply_text(welcome)
+    await update.message.reply_text(welcome, parse_mode="HTML")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     help_text = (
-        "PDF Converter Bot - Yordam\n\n"
-        "Qanday ishlaydi:\n"
-        "1. Menga rasm yoki matn fayli yuboring\n"
-        "2. Bot avtomatik ravishda PDF yaratadi\n"
-        "3. Tayyor PDF faylni sizga qaytaradi\n\n"
-        "Qo'llab-quvvatlanadigan formatlar:\n"
-        "  Rasmlar: JPG, JPEG, PNG, BMP, GIF, WebP, TIFF\n"
-        "  Hujjatlar: TXT\n\n"
-        "Bir nechta rasm yuborishingiz mumkin — ular bitta PDF bo'ladi.\n"
-        "Album sifatida yuboring."
+        "📖 <b>Yordam yo'riqnomasi</b>\n\n"
+        "1. <b>Albom rasmlar:</b> Bir nechta rasmni tanlab yuboring, bot ularni avtomatik bitta PDF qiladi.\n"
+        "2. <b>Hujjatlar:</b> .docx, .xlsx, .pptx, .txt fayl yuboring — PDF bo'lib qaytadi.\n"
+        "3. <b>PDF Fayllar:</b> PDF yuborsangiz, interaktiv menyu ochiladi. Parol o'rnatish, Word ga o'girish, Suv belgisi yoki Imzo qo'shishingiz mumkin.\n\n"
+        "<i>Buyruqlar:</i>\n"
+        "/start - Qayta ishga tushirish\n"
+        "/help - Yo'riqroma\n"
+        "/cancel - Harakatni bekor qilish"
     )
-    await update.message.reply_text(help_text)
+    await update.message.reply_text(help_text, parse_mode="HTML")
 
 
-async def convert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Iltimos, PDF ga aylantirish uchun rasm yoki matn faylini yuboring."
-    )
-    return WAITING_FILE
-
-
-async def _process_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.photo:
-        photo = update.message.photo[-1]
-        file = await photo.get_file()
-        ext = ".jpg"
-    elif update.message.document:
-        document = update.message.document
-        file = await document.get_file()
-        ext = os.path.splitext(document.file_name or "file")[1]
-    else:
-        await update.message.reply_text("Fayl topilmadi.")
-        return
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    input_path = f"temp_{timestamp}{ext}"
-    output_path = f"output_{timestamp}.pdf"
-
-    status_msg = await update.message.reply_text("Fayl yuklanmoqda...")
-
-    try:
-        await file.download_to_drive(input_path)
-        await status_msg.edit_text("PDF yaratilmoqda...")
-
-        if is_image(input_path):
-            try:
-                image_to_pdf_with_reportlab(input_path, output_path)
-            except Exception:
-                images_to_pdf([input_path], output_path)
-        elif ext == ".txt":
-            with open(input_path, "r", encoding="utf-8") as f:
-                text_content = f.read()
-            text_to_pdf(text_content, output_path)
-        else:
-            await status_msg.edit_text(
-                f"Bu format hozircha qo'llab-quvvatlanmaydi: {ext}"
-            )
-            return
-
-        with open(output_path, "rb") as pdf_file:
-            await update.message.reply_document(
-                document=pdf_file,
-                filename=f"converted_{timestamp}.pdf",
-                caption="PDF tayyor!",
-            )
-        await status_msg.delete()
-
-    except Exception as e:
-        logger.error(f"Xatolik: {e}")
-        await status_msg.edit_text(
-            f"Xatolik yuz berdi: {str(e)[:200]}\n"
-            "Iltimos, boshqa fayl yuboring."
-        )
-    finally:
-        for f in [input_path, output_path]:
-            if os.path.exists(f):
-                os.remove(f)
-
+# ------------------------------------------
+# ALBUM & PHOTO HANDLERS
+# ------------------------------------------
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _process_file(update, context)
-    return ConversationHandler.END
+    msg = update.message
+    
+    # Agar foydalanuvchi "Imzo/Muhr" rejimida bo'lsa
+    if context.user_data.get("awaiting_stamp_img"):
+        file_id = context.user_data.pop("stamp_pdf_file_id", None)
+        context.user_data["awaiting_stamp_img"] = False
+        if file_id:
+            await process_stamp_action(update, context, file_id, msg.photo[-1].file_id)
+            return
 
+    media_group_id = msg.media_group_id
+    chat_id = update.effective_chat.id
+    photo = msg.photo[-1]
 
-async def handle_photo_standalone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _process_file(update, context)
+    if media_group_id:
+        if media_group_id not in ALBUM_BUFFERS:
+            ALBUM_BUFFERS[media_group_id] = {
+                "chat_id": chat_id,
+                "photos": [],
+                "timer_task": None,
+                "status_msg": None,
+            }
+        buffer = ALBUM_BUFFERS[media_group_id]
+        
+        file = await photo.get_file()
+        tmp_img = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+        tmp_img.close()
+        await file.download_to_drive(tmp_img.name)
+        buffer["photos"].append(tmp_img.name)
 
+        if buffer["status_msg"] is None:
+            buffer["status_msg"] = await msg.reply_text("📥 Albom rasmlari qabul qilinmoqda...")
 
-async def handle_album_photos(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message.photo:
+        if buffer["timer_task"]:
+            buffer["timer_task"].cancel()
+
+        buffer["timer_task"] = asyncio.create_task(process_album_after_delay(media_group_id, context))
         return
 
-    if "album_photos" not in context.user_data:
-        context.user_data["album_photos"] = []
-        context.user_data["album_processed"] = False
-
-    photo = update.message.photo[-1]
+    # Yakka rasm
     file = await photo.get_file()
+    status_msg = await msg.reply_text(f"📥 Rasm yuklanmoqda... {render_progress_bar(20)}")
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    input_path = f"album_{timestamp}_{photo.file_id[-8:]}.jpg"
-    await file.download_to_drive(input_path)
-    context.user_data["album_photos"].append(input_path)
-
-    if not context.user_data.get("album_timer_set"):
-        context.user_data["album_timer_set"] = True
-        context.job_queue.run_once(
-            process_album, 2.0, context=update.effective_chat.id, name="album_timer"
-        )
-
-
-async def process_album(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.context
-    photos = context.user_data.get("album_photos", [])
-
-    if not photos or context.user_data.get("album_processed"):
-        return
-
-    context.user_data["album_processed"] = True
-
-    status_msg = await context.bot.send_message(
-        chat_id, f"{len(photos)} ta rasm PDF ga aylantirilmoqda..."
-    )
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = f"album_{timestamp}.pdf"
-
-    try:
-        images_to_pdf(photos, output_path)
-
-        with open(output_path, "rb") as pdf_file:
-            await context.bot.send_document(
-                chat_id,
-                pdf_file,
-                filename=f"album_{timestamp}.pdf",
-                caption=f"{len(photos)} tadan tashkil topgan PDF tayyor!",
-            )
-        await status_msg.delete()
-    except Exception as e:
-        logger.error(f"Album xatolik: {e}")
-        await status_msg.edit_text("PDF yaratishda xatolik yuz berdi.")
-    finally:
-        for p in photos:
-            if os.path.exists(p):
-                os.remove(p)
-        if os.path.exists(output_path):
-            os.remove(output_path)
-
-    context.user_data["album_photos"] = []
-    context.user_data["album_processed"] = False
-    context.user_data["album_timer_set"] = False
-
-
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    document = update.message.document
-    if not document:
-        return
-
-    filename = document.file_name or "file"
-    ext = os.path.splitext(filename.lower())[1]
-
-    if ext == ".txt":
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        input_path = f"doc_{timestamp}{ext}"
-        output_path = f"doc_{timestamp}.pdf"
-
-        status_msg = await update.message.reply_text("Fayl yuklanmoqda...")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        input_path = os.path.join(tmp_dir, "input.jpg")
+        output_pdf = os.path.join(tmp_dir, "converted.pdf")
+        
+        await file.download_to_drive(input_path)
+        await status_msg.edit_text(f"⚡ PDF yaratilmoqda... {render_progress_bar(70)}")
 
         try:
-            file = await document.get_file()
-            await file.download_to_drive(input_path)
-            await status_msg.edit_text("PDF yaratilmoqda...")
-
-            with open(input_path, "r", encoding="utf-8") as f:
-                text_content = f.read()
-
-            text_to_pdf(text_content, output_path)
-
-            with open(output_path, "rb") as pdf_file:
-                await update.message.reply_document(
-                    document=pdf_file,
-                    filename=f"{os.path.splitext(filename)[0]}.pdf",
-                    caption="PDF tayyor!",
+            await asyncio.to_thread(images_to_pdf_sync, [input_path], output_pdf)
+            await status_msg.edit_text(f"✅ Tayyor! {render_progress_bar(100)}")
+            
+            with open(output_pdf, "rb") as f:
+                await msg.reply_document(
+                    document=f,
+                    filename=f"photo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                    caption="✅ PDF tayyor bo'ldi!",
                 )
             await status_msg.delete()
         except Exception as e:
-            logger.error(f"Document xatolik: {e}")
-            await status_msg.edit_text(f"Xatolik: {str(e)[:200]}")
+            logger.error(f"Single photo conversion error: {e}")
+            await status_msg.edit_text(f"❌ Xatolik: {e}")
+
+
+async def process_album_after_delay(media_group_id: str, context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.sleep(1.8)
+    if media_group_id not in ALBUM_BUFFERS:
+        return
+
+    buffer = ALBUM_BUFFERS.pop(media_group_id)
+    chat_id = buffer["chat_id"]
+    photos = buffer["photos"]
+    status_msg = buffer["status_msg"]
+
+    if status_msg:
+        try:
+            await status_msg.edit_text(f"⚡ {len(photos)} ta rasm PDF ga o'girilmoqda... {render_progress_bar(60)}")
+        except Exception:
+            pass
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        output_pdf = os.path.join(tmp_dir, "album.pdf")
+        try:
+            await asyncio.to_thread(images_to_pdf_sync, photos, output_pdf)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with open(output_pdf, "rb") as f:
+                await context.bot.send_document(
+                    chat_id=chat_id,
+                    document=f,
+                    filename=f"album_{timestamp}.pdf",
+                    caption=f"✅ {len(photos)} ta rasmdan iborat PDF tayyor bo'ldi!",
+                )
+            if status_msg:
+                await status_msg.delete()
+        except Exception as e:
+            logger.error(f"Album error: {e}")
+            if status_msg:
+                await status_msg.edit_text(f"❌ Xatolik: {e}")
         finally:
-            for f in [input_path, output_path]:
-                if os.path.exists(f):
-                    os.remove(f)
-    elif is_image(filename):
-        await _process_file(update, context)
-    else:
-        await update.message.reply_text(
-            f"Bu format hozircha qo'llab-quvvatlanmaydi: {ext}\n"
-            "Qo'llab-quvvatlanadigan formatlar: rasm (jpg, png, bmp, gif, webp) va .txt"
+            for p in photos:
+                if os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+
+
+# ------------------------------------------
+# DOCUMENT HANDLERS (.docx, .xlsx, .pptx, .txt, .pdf)
+# ------------------------------------------
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    doc = msg.document
+    if not doc:
+        return
+
+    filename = doc.file_name or "document"
+    ext = Path(filename).suffix.lower()
+
+    # Image document
+    if is_image_file(filename):
+        status_msg = await msg.reply_text(f"📥 Rasm yuklanmoqda... {render_progress_bar(30)}")
+        file = await doc.get_file()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, filename)
+            output_pdf = os.path.join(tmp_dir, f"{Path(filename).stem}.pdf")
+            await file.download_to_drive(input_path)
+            await status_msg.edit_text(f"⚡ PDF yaratilmoqda... {render_progress_bar(80)}")
+            try:
+                await asyncio.to_thread(images_to_pdf_sync, [input_path], output_pdf)
+                with open(output_pdf, "rb") as f:
+                    await msg.reply_document(document=f, filename=f"{Path(filename).stem}.pdf", caption="✅ PDF tayyor!")
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Xatolik: {e}")
+        return
+
+    # Word (.docx)
+    if is_docx_file(filename):
+        status_msg = await msg.reply_text(f"📥 Word fayli yuklanmoqda... {render_progress_bar(25)}")
+        file = await doc.get_file()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, filename)
+            output_pdf = os.path.join(tmp_dir, f"{Path(filename).stem}.pdf")
+            await file.download_to_drive(input_path)
+            await status_msg.edit_text(f"⚡ PDF shakllantirilmoqda... {render_progress_bar(75)}")
+            try:
+                await asyncio.to_thread(docx_to_pdf_sync, input_path, output_pdf)
+                with open(output_pdf, "rb") as f:
+                    await msg.reply_document(document=f, filename=f"{Path(filename).stem}.pdf", caption="✅ Word -> PDF tayyor!")
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Word o'girishda xatolik: {e}")
+        return
+
+    # Excel (.xlsx)
+    if is_excel_file(filename):
+        status_msg = await msg.reply_text(f"📥 Excel fayli yuklanmoqda... {render_progress_bar(25)}")
+        file = await doc.get_file()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, filename)
+            output_pdf = os.path.join(tmp_dir, f"{Path(filename).stem}.pdf")
+            await file.download_to_drive(input_path)
+            await status_msg.edit_text(f"⚡ Excel jadvallari PDF qilinmoqda... {render_progress_bar(75)}")
+            try:
+                await asyncio.to_thread(excel_to_pdf_sync, input_path, output_pdf)
+                with open(output_pdf, "rb") as f:
+                    await msg.reply_document(document=f, filename=f"{Path(filename).stem}.pdf", caption="✅ Excel -> PDF tayyor!")
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Excel o'girishda xatolik: {e}")
+        return
+
+    # PowerPoint (.pptx)
+    if is_pptx_file(filename):
+        status_msg = await msg.reply_text(f"📥 Prezentatsiya yuklanmoqda... {render_progress_bar(25)}")
+        file = await doc.get_file()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, filename)
+            output_pdf = os.path.join(tmp_dir, f"{Path(filename).stem}.pdf")
+            await file.download_to_drive(input_path)
+            await status_msg.edit_text(f"⚡ Slaydlar PDF qilinmoqda... {render_progress_bar(75)}")
+            try:
+                await asyncio.to_thread(pptx_to_pdf_sync, input_path, output_pdf)
+                with open(output_pdf, "rb") as f:
+                    await msg.reply_document(document=f, filename=f"{Path(filename).stem}.pdf", caption="✅ PPTX -> PDF tayyor!")
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Prezentatsiya o'girishda xatolik: {e}")
+        return
+
+    # Text (.txt, .md, .log, .json ...)
+    if is_text_file(filename):
+        status_msg = await msg.reply_text(f"📥 Matn fayli yuklanmoqda... {render_progress_bar(30)}")
+        file = await doc.get_file()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_path = os.path.join(tmp_dir, filename)
+            output_pdf = os.path.join(tmp_dir, f"{Path(filename).stem}.pdf")
+            await file.download_to_drive(input_path)
+            await status_msg.edit_text(f"⚡ PDF formatiga o'tkazilmoqda... {render_progress_bar(85)}")
+            try:
+                with open(input_path, "rb") as f:
+                    raw_bytes = f.read()
+                detected = chardet.detect(raw_bytes)
+                encoding = detected.get("encoding") or "utf-8"
+                try:
+                    text_content = raw_bytes.decode(encoding)
+                except Exception:
+                    text_content = raw_bytes.decode("utf-8", errors="ignore")
+                
+                await asyncio.to_thread(text_to_pdf_sync, text_content, output_pdf, Path(filename).stem)
+                with open(output_pdf, "rb") as f:
+                    await msg.reply_document(document=f, filename=f"{Path(filename).stem}.pdf", caption="✅ Matn -> PDF tayyor!")
+                await status_msg.delete()
+            except Exception as e:
+                await status_msg.edit_text(f"❌ Matn o'girishda xatolik: {e}")
+        return
+
+    # PDF File (Toolkit Menu)
+    if ext == ".pdf":
+        file_id = doc.file_id
+        keyboard = [
+            [
+                InlineKeyboardButton("📝 PDF -> Word (.docx)", callback_data=f"pdf:to_docx:{file_id}"),
+                InlineKeyboardButton("🖼 PDF -> Rasmlar", callback_data=f"pdf:to_img:{file_id}"),
+            ],
+            [
+                InlineKeyboardButton("🔒 Parol qo'yish", callback_data=f"pdf:encrypt:{file_id}"),
+                InlineKeyboardButton("🔓 Parolni yechish", callback_data=f"pdf:decrypt:{file_id}"),
+            ],
+            [
+                InlineKeyboardButton("✂️ Sahifalarni o'chirish", callback_data=f"pdf:del_pages:{file_id}"),
+                InlineKeyboardButton("💧 Suv belgisi", callback_data=f"pdf:watermark:{file_id}"),
+            ],
+            [
+                InlineKeyboardButton("✍️ Imzo / Muhr qo'yish", callback_data=f"pdf:stamp:{file_id}"),
+                InlineKeyboardButton("🗜 Hajmini siqish", callback_data=f"pdf:compress:{file_id}"),
+            ],
+            [
+                InlineKeyboardButton("📄 Matnni ajratish", callback_data=f"pdf:to_txt:{file_id}"),
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await msg.reply_text(
+            f"📄 <b>{filename}</b> qabul qilindi.\n\n"
+            "Ushbu PDF bo'yicha amalnigizni tanlang:",
+            parse_mode="HTML",
+            reply_markup=reply_markup,
+        )
+        return
+
+    await msg.reply_text(
+        f"⚠️ <b>{ext}</b> formati qo'llab-quvvatlanmaydi."
+    )
+
+
+# ------------------------------------------
+# PDF TOOLKIT CALLBACK HANDLER
+# ------------------------------------------
+
+async def handle_pdf_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    data = query.data
+    if not data.startswith("pdf:"):
+        return
+
+    parts = data.split(":", 2)
+    action = parts[1]
+    file_id = parts[2]
+    msg = query.message
+
+    # 1. PDF -> Word (.docx)
+    if action == "to_docx":
+        await msg.edit_text(f"⏳ PDF Word (.docx) ga o'girilmoqda... {render_progress_bar(40)}")
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pdf_path = os.path.join(tmp_dir, "input.pdf")
+                docx_path = os.path.join(tmp_dir, "converted.docx")
+                await telegram_file.download_to_drive(pdf_path)
+                
+                await msg.edit_text(f"⚡ Word struktura tuzilmoqda... {render_progress_bar(80)}")
+                await asyncio.to_thread(pdf_to_docx_sync, pdf_path, docx_path)
+                
+                with open(docx_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=msg.chat_id,
+                        document=f,
+                        filename="converted.docx",
+                        caption="✅ PDF Word ga muvaffaqiyatli o'girildi!",
+                    )
+                await msg.delete()
+        except Exception as e:
+            logger.error(f"PDF to docx error: {e}")
+            await msg.edit_text(f"❌ Word o'girishda xatolik: {e}")
+
+    # 2. PDF -> Rasmlar (JPG)
+    elif action == "to_img":
+        await msg.edit_text(f"⏳ Sahifalar rasmlarga ajratilmoqda... {render_progress_bar(50)}")
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pdf_path = os.path.join(tmp_dir, "input.pdf")
+                await telegram_file.download_to_drive(pdf_path)
+                
+                img_paths = await asyncio.to_thread(pdf_to_images_sync, pdf_path, tmp_dir)
+                if not img_paths:
+                    await msg.edit_text("❌ PDF ichida sahifa topilmadi.")
+                    return
+                
+                await msg.edit_text(f"📤 {len(img_paths)} ta rasm yuborilmoqda... {render_progress_bar(90)}")
+                for i in range(0, min(len(img_paths), 30), 10):
+                    chunk = img_paths[i:i+10]
+                    media_group = [InputMediaDocument(media=open(p, "rb")) for p in chunk]
+                    await context.bot.send_media_group(chat_id=msg.chat_id, media=media_group)
+                await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ Rasmlarga ajratishda xatolik: {e}")
+
+    # 3. PDF Encrypt (Parol qo'yish)
+    elif action == "encrypt":
+        context.user_data["action_pdf_file_id"] = file_id
+        context.user_data["pending_action"] = "encrypt"
+        await msg.edit_text(
+            "🔒 <b>PDF ga parol o'rnatish</b>\n\n"
+            "Iltimos, PDF fayl uchun o'rnatmoqchi bo'lgan parolingizni yozib yuboring:",
+            parse_mode="HTML",
         )
 
+    # 4. PDF Decrypt (Parol olib tashlash)
+    elif action == "decrypt":
+        context.user_data["action_pdf_file_id"] = file_id
+        context.user_data["pending_action"] = "decrypt"
+        await msg.edit_text(
+            "🔓 <b>PDF parolini yechish</b>\n\n"
+            "Iltimos, ushbu PDF faylning parolini yozib yuboring:",
+            parse_mode="HTML",
+        )
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Iltimos, PDF ga aylantirish uchun rasm yoki fayl yuboring.\n"
-        "Yordam uchun /help buyrug'ini ishlating."
-    )
+    # 5. Delete Pages (Sahifalarni o'chirish)
+    elif action == "del_pages":
+        context.user_data["action_pdf_file_id"] = file_id
+        context.user_data["pending_action"] = "del_pages"
+        await msg.edit_text(
+            "✂️ <b>Sahifalarni o'chirish</b>\n\n"
+            "O'chirmoqchi bo megan sahifa raqamlarini vergul bilan yuboring:\n"
+            "<i>Masalan: 2, 5, 8</i>",
+            parse_mode="HTML",
+        )
+
+    # 6. Watermark (Suv belgisi)
+    elif action == "watermark":
+        context.user_data["action_pdf_file_id"] = file_id
+        context.user_data["pending_action"] = "watermark"
+        await msg.edit_text(
+            "💧 <b>Suv belgisi (Watermark) qo'shish</b>\n\n"
+            "PDF sahifalariga yoziladigan matnni yuboring:\n"
+            "<i>Masalan: MAXFIY yoki Shaxsiy</i>",
+            parse_mode="HTML",
+        )
+
+    # 7. Stamp / Imzo
+    elif action == "stamp":
+        context.user_data["stamp_pdf_file_id"] = file_id
+        context.user_data["awaiting_stamp_img"] = True
+        await msg.edit_text(
+            "✍️ <b>Imzo yoki Muhr joylashtirish</b>\n\n"
+            "Iltimos, PDF-ga qo'ymoqchi bo'lgan <b>shaffof PNG imzo/muhr rasmini</b> yuboring:",
+            parse_mode="HTML",
+        )
+
+    # 8. Compress
+    elif action == "compress":
+        await msg.edit_text(f"⚡ PDF siqilmoqda... {render_progress_bar(45)}")
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pdf_path = os.path.join(tmp_dir, "input.pdf")
+                out_path = os.path.join(tmp_dir, "compressed.pdf")
+                await telegram_file.download_to_drive(pdf_path)
+                orig_size = os.path.getsize(pdf_path)
+                
+                await asyncio.to_thread(pdf_compress_sync, pdf_path, out_path)
+                comp_size = os.path.getsize(out_path)
+                
+                orig_mb = round(orig_size / (1024 * 1024), 2)
+                comp_mb = round(comp_size / (1024 * 1024), 2)
+                
+                with open(out_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=msg.chat_id,
+                        document=f,
+                        filename="compressed.pdf",
+                        caption=f"✅ PDF hajmi siqildi!\n\n📊 Avvalgi: {orig_mb} MB\n📉 Yangi: {comp_mb} MB",
+                    )
+                await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ PDF siqishda xatolik: {e}")
+
+    # 9. Extract Text
+    elif action == "to_txt":
+        await msg.edit_text(f"⏳ Matn ajratib olinmoqda... {render_progress_bar(50)}")
+        try:
+            telegram_file = await context.bot.get_file(file_id)
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                pdf_path = os.path.join(tmp_dir, "input.pdf")
+                await telegram_file.download_to_drive(pdf_path)
+                
+                text = await asyncio.to_thread(pdf_extract_text_sync, pdf_path)
+                if not text.strip():
+                    await msg.edit_text("⚠️ PDF ichida matn topilmadi.")
+                    return
+                
+                txt_path = os.path.join(tmp_dir, "extracted.txt")
+                with open(txt_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                
+                with open(txt_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=msg.chat_id,
+                        document=f,
+                        filename="extracted_text.txt",
+                        caption="✅ Ajratib olingan matn!",
+                    )
+                await msg.delete()
+        except Exception as e:
+            await msg.edit_text(f"❌ Matn ajratishda xatolik: {e}")
+
+
+# ------------------------------------------
+# USER TEXT RESPONSE HANDLER (For Pending Actions)
+# ------------------------------------------
+
+async def handle_user_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.strip()
+    pending_action = context.user_data.pop("pending_action", None)
+    file_id = context.user_data.pop("action_pdf_file_id", None)
+
+    if not pending_action or not file_id:
+        await update.message.reply_text(
+            "Iltimos, PDF ga aylantirish uchun rasm yoki fayl yuboring.\n"
+            "Yordam uchun /help buyrug'ini ishlating."
+        )
+        return
+
+    status_msg = await update.message.reply_text(f"⚡ Bajarilmoqda... {render_progress_bar(40)}")
+
+    try:
+        telegram_file = await context.bot.get_file(file_id)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_pdf = os.path.join(tmp_dir, "input.pdf")
+            output_pdf = os.path.join(tmp_dir, "processed.pdf")
+            await telegram_file.download_to_drive(input_pdf)
+
+            if pending_action == "encrypt":
+                await asyncio.to_thread(pdf_encrypt_sync, input_pdf, output_pdf, user_text)
+                caption = "🔒 PDF parollangan holda saqlandi!"
+                filename = "protected.pdf"
+
+            elif pending_action == "decrypt":
+                await asyncio.to_thread(pdf_decrypt_sync, input_pdf, output_pdf, user_text)
+                caption = "🔓 PDF paroli olib tashlandi!"
+                filename = "unlocked.pdf"
+
+            elif pending_action == "del_pages":
+                pages = [int(p.strip()) for p in re.split(r"[,; ]+", user_text) if p.strip().isdigit()]
+                if not pages:
+                    await status_msg.edit_text("❌ Yaroqli sahifa raqamlari kiritilmadi.")
+                    return
+                await asyncio.to_thread(pdf_delete_pages_sync, input_pdf, output_pdf, pages)
+                caption = f"✂️ {len(pages)} ta sahifa o'chirildi!"
+                filename = "modified.pdf"
+
+            elif pending_action == "watermark":
+                await asyncio.to_thread(pdf_add_watermark_sync, input_pdf, output_pdf, user_text)
+                caption = "💧 Suv belgisi muvaffaqiyatli qo'shildi!"
+                filename = "watermarked.pdf"
+
+            else:
+                await status_msg.edit_text("❌ Noma'lum amal.")
+                return
+
+            await status_msg.edit_text(f"✅ Tayyor! {render_progress_bar(100)}")
+            with open(output_pdf, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename=filename,
+                    caption=caption,
+                )
+            await status_msg.delete()
+
+    except Exception as e:
+        logger.error(f"Pending action error ({pending_action}): {e}")
+        await status_msg.edit_text(f"❌ Xatolik yuz berdi: {e}")
+
+
+async def process_stamp_action(update: Update, context: ContextTypes.DEFAULT_TYPE, pdf_file_id: str, photo_file_id: str):
+    status_msg = await update.message.reply_text(f"⚡ Imzo PDF-ga joylashtirilmoqda... {render_progress_bar(50)}")
+    try:
+        pdf_file = await context.bot.get_file(pdf_file_id)
+        photo_file = await context.bot.get_file(photo_file_id)
+        
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            input_pdf = os.path.join(tmp_dir, "input.pdf")
+            stamp_img = os.path.join(tmp_dir, "stamp.png")
+            output_pdf = os.path.join(tmp_dir, "stamped.pdf")
+            
+            await pdf_file.download_to_drive(input_pdf)
+            await photo_file.download_to_drive(stamp_img)
+            
+            await asyncio.to_thread(pdf_add_stamp_sync, input_pdf, output_pdf, stamp_img, 1)
+            
+            await status_msg.edit_text(f"✅ Tayyor! {render_progress_bar(100)}")
+            with open(output_pdf, "rb") as f:
+                await update.message.reply_document(
+                    document=f,
+                    filename="stamped_document.pdf",
+                    caption="✍️ Imzo/Muhr PDF-ga joylashtirildi!",
+                )
+            await status_msg.delete()
+    except Exception as e:
+        logger.error(f"Stamp process error: {e}")
+        await status_msg.edit_text(f"❌ Imzo qo'shishda xatolik: {e}")
 
 
 def main():
-    if TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if TOKEN == "YOUR_BOT_TOKEN_HERE" or not TOKEN:
         print("=" * 50)
-        print("BOT_TOKEN o'zgartirilishi kerak!")
-        print("Quidagi usullardan birini ishlating:")
-        print("1. Environment variable: set BOT_TOKEN=your_token")
-        print("2. bot.py faylida TOKEN o'rniga tokeningizni yozing")
+        print("XATOLIK: BOT_TOKEN o'rnatilmagan!")
         print("=" * 50)
         return
 
-    try:
-        asyncio.get_event_loop()
-    except RuntimeError:
-        asyncio.set_event_loop(asyncio.new_event_loop())
-
     app = Application.builder().token(TOKEN).build()
 
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("convert", convert_command)],
-        states={
-            WAITING_FILE: [
-                MessageHandler(filters.PHOTO, handle_photo),
-                MessageHandler(filters.Document.ALL, handle_document),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", lambda u, c: ConversationHandler.END)],
-    )
-
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(conv_handler)
-    app.add_handler(
-        MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo_standalone)
-    )
-    app.add_handler(
-        MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document)
-    )
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
 
-    print("Bot ishga tushdi...")
-    print("To'xtatish uchun Ctrl+C bosing")
+    app.add_handler(MessageHandler(filters.PHOTO & ~filters.COMMAND, handle_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL & ~filters.COMMAND, handle_document))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
+    app.add_handler(CallbackQueryHandler(handle_pdf_callback))
+
+    print("🚀 Super PDF Converter Bot ishga tushdi...")
+    print("To'xtatish uchun Ctrl+C bosing.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
