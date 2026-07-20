@@ -1268,6 +1268,13 @@ def main():
         print("=" * 50)
         return
 
+    # Python 3.10+ / 3.14 Event loop tayyorlash
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
