@@ -60,6 +60,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.error import Conflict, NetworkError, TimedOut
 
 # Logging sozlamalari
 logging.basicConfig(
@@ -1387,6 +1388,24 @@ def start_health_check_server():
             logger.warning(f"Health Check Server xatosi: {e}")
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Global error handler so one failure logs cleanly instead of an unhandled traceback."""
+    err = context.error
+    if isinstance(err, Conflict):
+        # Another process is polling with the same token (e.g. a local run and
+        # Render at once, two Render services, or a deploy overlap).
+        logger.warning(
+            "Conflict: boshqa bot instansiyasi getUpdates ishlatmoqda. "
+            "Faqat BITTA instansiya ishlayotganiga ishonch hosil qiling "
+            "(lokal va Render bir vaqtda ishlamasin)."
+        )
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning(f"Tarmoq xatosi (avtomatik qayta urinadi): {err}")
+        return
+    logger.error("Update ishlovida kutilmagan xatolik:", exc_info=err)
+
+
 def main():
     if TOKEN == "YOUR_BOT_TOKEN_HERE" or not TOKEN:
         print("=" * 50)
@@ -1414,9 +1433,15 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_text))
     app.add_handler(CallbackQueryHandler(handle_pdf_callback))
 
+    # Xatoliklarni chiroyli log qilish uchun global error handler
+    app.add_error_handler(error_handler)
+
     print("🚀 Super PDF Converter Bot ishga tushdi...")
     print("To'xtatish uchun Ctrl+C bosing.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True — qayta ishga tushganda eski (navbatdagi)
+    # yangilanishlarni tashlab yuboradi, bu takroriy ishlov va ba'zi
+    # Conflict holatlarini kamaytiradi.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
