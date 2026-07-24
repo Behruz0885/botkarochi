@@ -1363,27 +1363,28 @@ async def process_stamp_action(update: Update, context: ContextTypes.DEFAULT_TYP
         await status_msg.edit_text(f"❌ Imzo qo'shishda xatolik: {e}")
 
 
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import threading
+from flask import Flask
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return 'OK', 200  # Explicitly return 200 OK
 
 def start_health_check_server():
     port_str = os.getenv("PORT")
     if port_str:
         try:
             port = int(port_str)
-            server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread = threading.Thread(
+                target=lambda: app.run(
+                    host="0.0.0.0", port=port, debug=False, use_reloader=False
+                ),
+                daemon=True,
+            )
             thread.start()
-            logger.info(f"Render Health Check HTTP server {port}-portda ishga tushdi.")
+            logger.info(f"Render Health Check Flask server {port}-portda ishga tushdi.")
         except Exception as e:
             logger.warning(f"Health Check Server xatosi: {e}")
 
